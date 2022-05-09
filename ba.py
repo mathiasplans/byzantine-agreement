@@ -36,17 +36,45 @@ class Serv(rpyc.Service):
     def exposed_get_leader_port(self):
         return self.p.primary_port
 
+    def exposed_order(self, command):
+        self.p.command = command
+
+    def exposed_get_order(self):
+        # Faulty node will return randomly
+        if self.p.faulty:
+            if random.randint(0, 1) == 0:
+                return "attack"
+
+            else:
+                return "retreat"
+
+        # Non-faulty node will return truthfully
+        else:
+            # Wait until the command has been received
+            while self.p.command == None:
+                time.sleep(0.2)
+
+            return self.p.command
+
+    def exposed_get_majority(self):
+        while self.p.majority == None:
+            time.sleep(0.2)
+
+        return self.p.majority
+
 # Client for the general
 class Process:
     def __init__(self, id, port):
         self.id = id
         self.port = port
-        self.lock = _thread.allocate_lock()
         self.loop = None
         self.primary = False
         self.primary_port = -1
         self.faulty = False
         self.killed = False
+
+        self.command = None
+        self.majority = None
 
         partialserv = classpartial(Serv, self);
         self.ts = ThreadedServer(partialserv, port=port)
@@ -86,15 +114,19 @@ class Process:
     def set_leader(self, leader_port):
         self.primary_port = leader_port
 
+    def others(self):
+        for p in others:
+            if p == self.port:
+                continue
+
+            yield p
+
     # Election is for life, therefore only happens
     # when there is no leader currently.
     def elect(self):
         # See if this node has the lowest ID
         lowest = True
-        for p in others:
-            if p == self.port:
-                continue
-
+        for p in self.others():
             try:
                 c = rpyc.connect("localhost", p)
                 other_id = c.root.get_id()
@@ -110,10 +142,7 @@ class Process:
 
         # If the election was won, let everyone know
         if lowest:
-            for p in others:
-                if p == self.port:
-                    continue
-
+            for p in self.others():
                 try:
                     c = rpyc.connect("localhost", p)
                     c.root.new_leader(self.port)
@@ -127,21 +156,154 @@ class Process:
         else:
             self.primary = False
 
+    def get_majority(self, command):
+        n_attack = 0
+        n_retreat = 0
+
+        if command == "attack":
+            n_attack += 1
+
+        else:
+            n_retreat += 1
+
+        for p in self.others():
+            # No need to ask the primary, we already have that info
+            if p == self.primary_port:
+                continue
+
+            try:
+                c = rpyc.connect("localhost", p)
+                o = c.root.get_order()
+                if o == "attack":
+                    n_attack += 1
+
+                else:
+                    n_retreat += 1
+
+                pass
+
+            except Exception as e:
+                pass
+
+        if n_attack > n_retreat:
+            self.majority = "attack"
+
+        elif n_retreat > n_attack:
+            self.majority = "retreat"
+
+        else:
+            self.majority = "undefined"
+
+    def get_majorities(self, majority):
+        n_attack = 0
+        n_retreat = 0
+        n_undefined = 0
+
+        # Include itself in the query
+        for p in others:
+            try:
+                c = rpyc.connect("localhost", p)
+                m = c.root.get_majority()
+
+                if m == "attack":
+                    n_attack += 1
+
+                elif m == "retreat":
+                    n_retreat += 1
+
+                else:
+                    n_undefined += 1
+
+                pass
+
+            except Exception as e:
+                # print(e)
+                pass
+
+        return (n_attack, n_retreat, n_undefined)
+
+    def quorum(self, nr_faulty):
+        n_attack, n_retreat, n_undefined = self.get_majorities(self.majority);
+        total = n_attack + n_retreat + n_undefined
+        k = (total - 1) // 3
+        needed = 2 * k + 1 # (3k + 1) - k
+
+        if total <= 3:
+            needed = total - 1
+
+        if total == 1:
+            needed = 1
+
+        quorum_text = f"{needed} out of {total} quorum suggests"
+        quorum_fail = f"{n_undefined} out of {total} quorum not consistent"
+
+        faulty_text = "Non-faulty nodes in the system"
+        if nr_faulty > 0:
+            faulty_text = f"{nr_faulty} faulty node(s) in the system"
+
+        decision = ""
+
+        if needed <= n_retreat:
+            decision = f"retreat! {faulty_text} - {quorum_text} retreat"
+
+        elif needed <= n_attack:
+            decision = f"attack! {faulty_text} - {quorum_text} attack"
+
+        else:
+            decision = f"cannot be determined - not enough generals in the system! {faulty_text} - {quorum_fail}"
+
+        print(f"Execute order: {decision}")
+
+    # Should only be called by the primary
+    def order(self, command):
+        assert self.primary
+
+        self.command = command
+
+        for p in self.others():
+            try:
+                c = rpyc.connect("localhost", p)
+
+                # Faulty leader will send randomly
+                if self.faulty:
+                    if random.randint(0, 1) == 0:
+                        c.root.order("attack")
+
+                    else:
+                        c.root.order("retreat")
+
+                # Non-faulty leader will send truthfully
+                else:
+                    c.root.order(command)
+
+                c.close()
+
+            except Exception as e:
+                pass
+
+        # Primary does not exchange info with other nodes
+        self.majority = command
+
+    def wait_majority(self):
+        while self.majority == None:
+            time.sleep(0.1)
+
+    def clear(self):
+        self.command = None
+        self.majority = None
+
     def run(self):
         # Create an event loop for this thread
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
         while True:
+            time.sleep(0.1)
+
             if self.killed:
                 _thread.exit()
 
-            if self.primary:
-                time.sleep(1)
-
-            else:
-                time.sleep(0.1) # TODO
-
+            if not self.primary:
                 # Check if primary is alive
                 try:
                     c = rpyc.connect("localhost", self.primary_port)
@@ -150,6 +312,11 @@ class Process:
                 except Exception:
                     # Start the election process
                     self.elect()
+
+
+                # Get the majority from other nodes if command is received
+                if self.command != None and self.majority == None:
+                    self.get_majority(self.command)
 
 
 def id_to_index(processes, ID):
@@ -205,6 +372,31 @@ if __name__ == '__main__':
 
         if command == "Exit":
             running = False
+
+        elif command == "actual-order":
+            if len(cmd) == 1:
+                continue
+
+            # The first process in the processes list is always the leader
+            processes[0].order(cmd[1])
+
+            # List the status
+            nr_faulty = 0
+            for p in processes:
+                p.wait_majority()
+                status = "primary" if p.primary else "secondary"
+                s = "F" if p.faulty else "NF"
+                print(f"G{p.id}, {status}, majority={p.majority}, state={s}")
+
+                if p.faulty:
+                    nr_faulty += 1
+
+            # Final decision
+            processes[0].quorum(nr_faulty)
+
+            # Clear the status
+            for p in processes:
+                p.clear()
 
         elif command == "g-state":
             if len(cmd) == 3:
