@@ -408,7 +408,9 @@ if __name__ == '__main__':
 
             for p in processes:
                 s = "F" if p.faulty else "NF"
-                print(f"G{p.id}, state={s}")
+                primarity = ", primary" if p.primary else ", secondary"
+                primarity = primarity if len(cmd) != 3 else ""
+                print(f"G{p.id}{primarity}, state={s}")
 
         elif command == "g-kill":
             if len(cmd) == 1:
